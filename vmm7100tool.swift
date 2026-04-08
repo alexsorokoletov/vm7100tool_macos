@@ -614,15 +614,14 @@ class VMM7100Tool {
             }
         }
 
-        // FW Version — real device returns [minor, major, patch] at bytes 15-17
+        // FW Version — HID only returns [minor, major] reliably at bytes 15-16
+        // Byte[17] is stale buffer data (e.g. 'I' from PRIUS), not patch version.
+        // Patch version requires DP AUX access (not available on macOS).
         let (verOk, verData) = rcCommand(cmd: .getVersion)
-        if verOk && verData.count >= 3 {
+        if verOk && verData.count >= 2 {
             let major = verData[1]
             let minor = verData[0]
-            let patch = verData[2]
-            print("  Firmware version: \(major).\(String(format: "%02d", minor)).\(String(format: "%03d", patch))")
-        } else if verOk && verData.count >= 2 {
-            print("  Firmware version: \(verData[1]).\(String(format: "%02d", verData[0]))")
+            print("  Firmware version: \(major).\(String(format: "%02d", minor)).xxx (patch unavailable via HID)")
         }
 
         // Read firmware name from memory
@@ -855,9 +854,9 @@ class VMM7100Tool {
         // Read current version + chip info for backup naming
         var versionStr = "unknown"
         let (verOk, verData) = rcCommand(cmd: .getVersion)
-        if verOk && verData.count >= 3 {
-            let major = verData[1]; let minor = verData[0]; let patch = verData[2]
-            versionStr = "\(major).\(String(format: "%02d", minor)).\(String(format: "%03d", patch))"
+        if verOk && verData.count >= 2 {
+            let major = verData[1]; let minor = verData[0]
+            versionStr = "\(major).\(String(format: "%02d", minor))"
             print("Current FW: \(versionStr)")
         }
 
