@@ -89,25 +89,25 @@ No DP Alt Mode required — communication happens over USB data pins, not Displa
 ## Screenshots
 
 ### Adapter Info
-![info](docs/info.webp)
+<img src="docs/info.webp" width="620" alt="vmm7100tool info">
 
 ### Firmware Flash
-![flash](docs/flash.webp)
+<img src="docs/flash.webp" width="620" alt="vmm7100tool flash">
 
 ### Flash Dry Run
-![flash-dryrun](docs/flash-dryrun.webp)
+<img src="docs/flash-dryrun.webp" width="620" alt="vmm7100tool flash --dry-run">
 
 ### Firmware Dump
-![dump](docs/dump.webp)
+<img src="docs/dump.webp" width="620" alt="vmm7100tool dump">
 
 ### Connected Display (EDID decode)
-![display](docs/display.webp)
+<img src="docs/display.webp" width="620" alt="vmm7100tool display">
 
 ### Stored EDID
-![edid](docs/edid.webp)
+<img src="docs/edid.webp" width="620" alt="vmm7100tool edid">
 
 ### Help
-![help](docs/help.webp)
+<img src="docs/help.webp" width="620" alt="vmm7100tool help">
 
 ## License
 
