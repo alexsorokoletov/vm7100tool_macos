@@ -2,6 +2,8 @@
 
 Native macOS CLI tool for Synaptics VMM7100 USB-C to HDMI 2.1 adapters. Flash firmware, read device info, dump/restore, reset board — no Windows or VM required.
 
+**Requires macOS 26+ (Tahoe)** for full functionality. Earlier macOS versions only support `info` (partial) and `reset`.
+
 ## Build
 
 ```bash
@@ -11,22 +13,25 @@ swiftc vmm7100tool.swift -o vmm7100tool
 ## Usage
 
 ```bash
-# Read adapter info (FW version, chip ID)
+# Read adapter info (FW version with patch, chip ID)
 ./vmm7100tool info
+
+# Diagnose HID capabilities on current macOS
+./vmm7100tool diagnose
 
 # Backup current firmware
 ./vmm7100tool dump backup.fullrom
 
-# Flash new firmware (auto-backs up current FW first)
-./vmm7100tool flash Spyder_fw_USBC_CMforMac4K120hz.fullrom
+# Flash new firmware
+./vmm7100tool flash firmware.fullrom
 
-# Preview flash plan without writing
+# Preview flash plan without writing (also reads version from file)
 ./vmm7100tool flash --dry-run firmware.fullrom
 
 # Reset adapter board
 ./vmm7100tool reset
 
-# Read EDID from connected display
+# Read stored EDID from flash
 ./vmm7100tool edid
 
 # Read/write chip registers
@@ -45,8 +50,7 @@ No DP Alt Mode required — communication happens over USB data pins, not Displa
 
 ## Safety
 
-- `flash` always creates an auto-backup of current firmware before writing (timestamped with device info)
-- `--dry-run` lets you preview the flash plan
+- `--dry-run` lets you preview the flash plan and read firmware version from file
 - CRC16 verification after write
 - `--force` to continue past CRC mismatch (use with caution)
 
@@ -61,11 +65,25 @@ No DP Alt Mode required — communication happens over USB data pins, not Displa
 
 ## Status
 
+### macOS 26+ (Tahoe) — full functionality
+- `info` — chip ID, revision, full firmware version including patch (e.g. 7.02.123)
+- `dump` — reads full 1MB firmware from flash
+- `flash` — erase + write + CRC verify works end-to-end
+- `edid` — reads stored EDID from flash
+- `reset` — board reset via known-good packets
+- `diagnose` — tests all HID paths and reports capabilities
 - Mock tests: 23/23 passing
-- Real device: `info` verified (VMM7100, FW 7.02, rev D9)
-- `edid`, `register`, `dump` — HID interface only supports getId/getVersion/write commands; read operations (ReadFromEEPROM, ReadFromMemory) return empty data via HID. These require DP AUX channel which isn't available on macOS without kernel driver support.
-- `flash` — write commands untested on real device yet (uses writeToEEPROM which may work since VmmHIDTool.exe does flash via HID on Windows)
-- `reset` — uses known-good packets from vmm7100reset.swift
+
+### macOS 15 and earlier — limited
+- `info` — chip ID and major.minor version only (no patch)
+- `reset` — works
+- `dump`, `edid`, `register` reads — return zeros/stale data (HID driver limitation)
+- `flash` — erase fails (error 3), writes are no-ops without erase
+
+### What still doesn't work (any macOS version)
+- `ReadFromMemory` (register reads) — returns error code 1 with stale buffer data
+- Interrupt IN endpoint callback — never fires
+- These limitations don't affect core functionality (flash/dump/info)
 
 ## License
 

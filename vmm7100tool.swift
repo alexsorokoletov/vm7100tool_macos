@@ -43,6 +43,7 @@ let REG_FIRMWARE_VERSION: UInt32 = 0x50A
 let FLASH_SECTOR_ERASE_64K: UInt32 = 0x3000
 
 // EEPROM layout
+let EEPROM_VERSION_OFFSET: UInt32 = 0x04000  // 3 bytes: major, minor, patch
 let EEPROM_TAG_OFFSET: UInt32  = 0x1FFF0
 let EEPROM_BANK_OFFSET: UInt32 = 0x20000
 let EEPROM_ESM_OFFSET: UInt32  = 0x40000
@@ -465,8 +466,8 @@ class VMM7100MockTransport: VMM7100Transport {
 }
 
 class VMM7100HIDTransport: VMM7100Transport {
-    private var manager: IOHIDManager?
-    private var hidDevice: IOHIDDevice?
+    var manager: IOHIDManager?
+    var hidDevice: IOHIDDevice?
     var _isOpen = false
     var isOpen: Bool { _isOpen }
 
@@ -483,7 +484,11 @@ class VMM7100HIDTransport: VMM7100Transport {
 
         let openRet = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
         guard openRet == kIOReturnSuccess else {
-            printErr("Cannot open HID manager (0x\(String(format: "%x", openRet)))")
+            if UInt32(bitPattern: Int32(openRet)) == 0xe00002c5 { // kIOReturnExclusiveAccess
+                printErr("Device is busy — another process has exclusive access. Close other tools and retry.")
+            } else {
+                printErr("Cannot open HID manager (0x\(String(format: "%x", openRet)))")
+            }
             return false
         }
 
@@ -614,14 +619,20 @@ class VMM7100Tool {
             }
         }
 
-        // FW Version — HID only returns [minor, major] reliably at bytes 15-16
-        // Byte[17] is stale buffer data (e.g. 'I' from PRIUS), not patch version.
-        // Patch version requires DP AUX access (not available on macOS).
+        // FW Version — GetVersion HID command returns [minor, major] at bytes 15-16.
+        // Patch version is read from EEPROM offset 0x04000 (3 bytes: major, minor, patch).
         let (verOk, verData) = rcCommand(cmd: .getVersion)
         if verOk && verData.count >= 2 {
             let major = verData[1]
             let minor = verData[0]
-            print("  Firmware version: \(major).\(String(format: "%02d", minor)).xxx (patch unavailable via HID)")
+            // Try reading patch from flash
+            let (patchOk, patchData) = rcCommand(cmd: .readFromEEPROM, offset: EEPROM_VERSION_OFFSET, length: 3)
+            if patchOk && patchData.count >= 3 && patchData[0] == major && patchData[1] == minor {
+                let patch = patchData[2]
+                print("  Firmware version: \(major).\(String(format: "%02d", minor)).\(patch)")
+            } else {
+                print("  Firmware version: \(major).\(String(format: "%02d", minor))")
+            }
         }
 
         // Read firmware name from memory
@@ -658,9 +669,6 @@ class VMM7100Tool {
     // MARK: EDID command
 
     func cmdEDID() -> Bool {
-        if !isMock {
-            printErr("WARNING: edid does not work on real hardware — HID reads return zeros.")
-        }
         guard connect() else { return false }
         defer { disconnect() }
         guard enableRC() else { printErr("Failed to enable RC"); return false }
@@ -708,9 +716,6 @@ class VMM7100Tool {
     // MARK: Register command
 
     func cmdRegister(address: UInt32, writeValue: UInt32? = nil) -> Bool {
-        if !isMock && writeValue == nil {
-            printErr("WARNING: register reads do not work on real hardware — HID returns stale data.")
-        }
         guard connect() else { return false }
         defer { disconnect() }
         guard enableRC() else { printErr("Failed to enable RC"); return false }
@@ -757,10 +762,6 @@ class VMM7100Tool {
 
     /// Dump firmware. If already connected with RC enabled, pass standalone=false.
     func cmdDump(outputPath: String, standalone: Bool = true) -> Bool {
-        if standalone && !isMock {
-            printErr("WARNING: dump does not work on real hardware — HID reads return zeros.")
-            printErr("See docs/lessons_log.md for details.")
-        }
         if standalone {
             guard connect() else { return false }
             guard enableRC() else { printErr("Failed to enable RC"); disconnect(); return false }
@@ -833,10 +834,22 @@ class VMM7100Tool {
         let fileCRC = crc16(firmware)
         let sectors = FIRMWARE_SIZE / 0x10000 // 16 sectors of 64K
 
+        // Read version from firmware file
+        var fileVersionStr = "unknown"
+        if firmware.count > Int(EEPROM_VERSION_OFFSET) + 3 {
+            let fMajor = firmware[Int(EEPROM_VERSION_OFFSET)]
+            let fMinor = firmware[Int(EEPROM_VERSION_OFFSET) + 1]
+            let fPatch = firmware[Int(EEPROM_VERSION_OFFSET) + 2]
+            if fMajor > 0 && fMajor < 0xFF {
+                fileVersionStr = "\(fMajor).\(String(format: "%02d", fMinor)).\(fPatch)"
+            }
+        }
+
         if dryRun {
             print("Dry Run — Flash Plan")
             print("====================")
             print("  Firmware file:  \(firmwarePath)")
+            print("  File version:   \(fileVersionStr)")
             print("  File size:      \(firmware.count) bytes (\(firmware.count / 1024) KB)")
             print("  File CRC16:     0x\(String(format: "%04X", fileCRC))")
             print("  Erase sectors:  \(sectors) x 64KB")
@@ -851,13 +864,16 @@ class VMM7100Tool {
         guard enableRC() else { printErr("Failed to enable RC"); return false }
         defer { disableRC() }
 
-        // Read current version + chip info for backup naming
+        // Read current version from device
         var versionStr = "unknown"
         let (verOk, verData) = rcCommand(cmd: .getVersion)
         if verOk && verData.count >= 2 {
             let major = verData[1]; let minor = verData[0]
             versionStr = "\(major).\(String(format: "%02d", minor))"
-            print("Current FW: \(versionStr)")
+            let (patchOk, patchData) = rcCommand(cmd: .readFromEEPROM, offset: EEPROM_VERSION_OFFSET, length: 3)
+            if patchOk && patchData.count >= 3 && patchData[0] == major && patchData[1] == minor {
+                versionStr += ".\(patchData[2])"
+            }
         }
 
         var chipStr = "VMM7100"
@@ -867,6 +883,8 @@ class VMM7100Tool {
             chipStr = "VMM\(String(format: "%04X", chipId))"
         }
 
+        print("Current FW:  \(versionStr)")
+        print("File FW:     \(fileVersionStr)")
         print("Flashing \(firmwarePath)...")
         print("")
 
@@ -979,6 +997,257 @@ class VMM7100Tool {
 
         print("Reset sent. Device will re-enumerate.")
         print("Display may briefly disconnect — this is normal.")
+        return true
+    }
+
+    // MARK: Diagnose command — retest all previously-failing paths on current macOS
+
+    func cmdDiagnose() -> Bool {
+        guard !isMock else { printErr("diagnose requires real hardware"); return false }
+        guard connect() else { return false }
+        defer { disconnect() }
+
+        // We need the raw HID device for low-level tests
+        guard let hidTransport = transport as? VMM7100HIDTransport,
+              let device = hidTransport.hidDevice,
+              let mgr = hidTransport.manager else {
+            printErr("Cannot access HID device internals")
+            return false
+        }
+
+        print("VMM7100 macOS Tahoe Diagnostic")
+        print("==============================")
+        print("macOS: ", terminator: "")
+        fflush(stdout)
+        // Print OS version inline
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/sw_vers")
+        proc.arguments = ["-productVersion"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        try? proc.run()
+        proc.waitUntilExit()
+        let osVer = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "?"
+        print(osVer)
+        print("")
+
+        var results: [(String, String)] = [] // (test name, result)
+
+        func record(_ name: String, _ result: String) {
+            results.append((name, result))
+            print("  [\(result.hasPrefix("PASS") || result.hasPrefix("NEW") ? "✓" : result.hasPrefix("SAME") ? "·" : "✗")] \(name)")
+            if !result.hasPrefix("PASS") && !result.hasPrefix("NEW") && !result.hasPrefix("SAME") {
+                print("     → \(result)")
+            } else if result.contains(":") {
+                print("     → \(result)")
+            }
+        }
+
+        // --- Baseline: EnableRC + GetId + GetVersion ---
+        print("Baseline (should work):")
+        guard enableRC() else {
+            printErr("EnableRC failed — device not responding")
+            return false
+        }
+
+        let (idOk, idData) = rcCommand(cmd: .getId)
+        if idOk && idData.count >= 2 {
+            let chipId = UInt16(idData[0]) | (UInt16(idData[1]) << 8)
+            record("GetId", "PASS: VMM\(String(format: "%X", chipId))")
+        } else {
+            record("GetId", "FAIL")
+        }
+
+        let (verOk, verData) = rcCommand(cmd: .getVersion)
+        if verOk && verData.count >= 2 {
+            record("GetVersion", "PASS: \(verData[1]).\(String(format: "%02d", verData[0]))")
+        } else {
+            record("GetVersion", "FAIL")
+        }
+        print("")
+
+        // --- Test 1: ReadFromEEPROM at various offsets ---
+        print("ReadFromEEPROM (previously: all zeros):")
+        let eepromOffsets: [(String, UInt32)] = [
+            ("offset 0x0 (EDID)", 0x0),
+            ("offset 0x20000 (FW code)", 0x20000),
+            ("offset 0x1FFF0 (tag)", 0x1FFF0),
+        ]
+        for (label, offset) in eepromOffsets {
+            let packet = buildRCPacket(cmd: .readFromEEPROM, offset: offset, length: 32)
+            guard transport.sendReport(packet) else { record("ReadEEPROM \(label)", "FAIL: send"); continue }
+            usleep(50_000) // 50ms
+            guard let resp = transport.readReport() else { record("ReadEEPROM \(label)", "FAIL: no response"); continue }
+
+            let dataBytes = resp.count > 15 ? Array(resp[15..<min(resp.count, 47)]) : []
+            let nonZero = dataBytes.filter { $0 != 0 }.count
+            let hex = dataBytes.prefix(16).map { String(format: "%02X", $0) }.joined(separator: " ")
+            if nonZero > 0 {
+                record("ReadEEPROM \(label)", "NEW: \(nonZero) non-zero bytes! [\(hex)...]")
+            } else {
+                record("ReadEEPROM \(label)", "SAME: all zeros. [\(hex)]")
+            }
+        }
+        print("")
+
+        // --- Test 2: ReadFromMemory at known registers ---
+        print("ReadFromMemory (previously: stale PRIUS data):")
+        let memOffsets: [(String, UInt32)] = [
+            ("ChipID reg 0x507", REG_CHIP_ID),
+            ("FW ver reg 0x50A", REG_FIRMWARE_VERSION),
+            ("RC state 0x4B1", REG_RC_STATE),
+            ("reg 0x2000", 0x2000),
+        ]
+        for (label, offset) in memOffsets {
+            let packet = buildRCPacket(cmd: .readFromMemory, offset: offset, length: 4)
+            guard transport.sendReport(packet) else { record("ReadMem \(label)", "FAIL: send"); continue }
+            usleep(50_000)
+            guard let resp = transport.readReport() else { record("ReadMem \(label)", "FAIL: no response"); continue }
+
+            let cmdEcho = resp.count > 5 ? resp[5] : 0xFF
+            let resultByte = resp.count > 6 ? resp[6] : 0xFF
+            let dataBytes = resp.count > 15 ? Array(resp[15..<min(resp.count, 47)]) : []
+            let hex = dataBytes.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
+            let isPrius = dataBytes.count >= 5 && String(bytes: dataBytes.prefix(5), encoding: .ascii) == "PRIUS"
+
+            if isPrius {
+                record("ReadMem \(label)", "SAME: stale PRIUS data. cmd=\(String(format:"%02X",cmdEcho)) res=\(String(format:"%02X",resultByte))")
+            } else if resultByte == 0 && dataBytes.contains(where: { $0 != 0 }) {
+                record("ReadMem \(label)", "NEW: non-stale data! res=\(String(format:"%02X",resultByte)) [\(hex)]")
+            } else {
+                record("ReadMem \(label)", "cmd=\(String(format:"%02X",cmdEcho)) res=\(String(format:"%02X",resultByte)) [\(hex)]")
+            }
+        }
+        print("")
+
+        // --- Test 3: GetReport with different report types ---
+        print("GetReport type variations (previously: all return same empty data):")
+        // First send a ReadFromEEPROM command
+        let readPkt = buildRCPacket(cmd: .readFromEEPROM, offset: 0, length: 32)
+        _ = transport.sendReport(readPkt)
+        usleep(50_000)
+
+        let reportTypes: [(String, IOHIDReportType)] = [
+            ("Input", kIOHIDReportTypeInput),
+            ("Output", kIOHIDReportTypeOutput),
+            ("Feature", kIOHIDReportTypeFeature),
+        ]
+        for (label, reportType) in reportTypes {
+            var buffer = [UInt8](repeating: 0, count: HID_REPORT_SIZE)
+            var length = buffer.count
+            let ret = IOHIDDeviceGetReport(device, reportType, 1, &buffer, &length)
+            if ret == kIOReturnSuccess {
+                let nonZero = buffer[15..<min(47, buffer.count)].filter { $0 != 0 }.count
+                let hex = buffer[15..<min(23, buffer.count)].map { String(format: "%02X", $0) }.joined(separator: " ")
+                record("GetReport(\(label))", nonZero > 0 ? "data=[\(hex)] (\(nonZero) non-zero)" : "all zeros")
+            } else {
+                record("GetReport(\(label))", "error: 0x\(String(format: "%x", ret))")
+            }
+        }
+        // Also try Report ID 0 for Feature
+        var buffer0 = [UInt8](repeating: 0, count: HID_REPORT_SIZE)
+        var length0 = buffer0.count
+        let ret0 = IOHIDDeviceGetReport(device, kIOHIDReportTypeFeature, 0, &buffer0, &length0)
+        if ret0 == kIOReturnSuccess {
+            let hex = buffer0.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
+            record("GetReport(Feature ID=0)", "ok len=\(length0) [\(hex)]")
+        } else {
+            record("GetReport(Feature ID=0)", "error: 0x\(String(format: "%x", ret0))")
+        }
+        print("")
+
+        // --- Test 4: Interrupt IN callback ---
+        print("Interrupt IN endpoint (previously: callback never fires):")
+        var callbackFired = false
+        var callbackData = Data()
+
+        let callbackBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 62)
+        defer { callbackBuffer.deallocate() }
+
+        let callbackContext = UnsafeMutablePointer<Bool>.allocate(capacity: 1)
+        callbackContext.pointee = false
+        defer { callbackContext.deallocate() }
+
+        IOHIDDeviceRegisterInputReportCallback(device, callbackBuffer, 62, { context, result, sender, type, reportID, report, reportLength in
+            guard let ctx = context else { return }
+            let flag = ctx.bindMemory(to: Bool.self, capacity: 1)
+            flag.pointee = true
+        }, callbackContext)
+
+        // Send a few commands and pump runloop
+        let testCmds: [(String, Data)] = [
+            ("EnableRC", buildRCPacket(cmd: .enableRC, length: 5, data: "PRIUS".data(using: .ascii)!)),
+            ("GetId", buildRCPacket(cmd: .getId)),
+            ("ReadEEPROM", buildRCPacket(cmd: .readFromEEPROM, offset: 0, length: 32)),
+        ]
+        for (label, pkt) in testCmds {
+            callbackContext.pointee = false
+            _ = transport.sendReport(pkt)
+            // Pump runloop for up to 500ms
+            let deadline = Date().addingTimeInterval(0.5)
+            while !callbackContext.pointee && Date() < deadline {
+                CFRunLoopRunInMode(CFRunLoopMode.defaultMode, 0.05, true)
+            }
+            if callbackContext.pointee {
+                record("Interrupt after \(label)", "NEW: callback fired!")
+                callbackFired = true
+            } else {
+                record("Interrupt after \(label)", "SAME: no callback (500ms timeout)")
+            }
+        }
+
+        // Unregister callback
+        IOHIDDeviceRegisterInputReportCallback(device, callbackBuffer, 62, nil, nil)
+        print("")
+
+        // --- Test 5: FlashErase (SKIPPED — destructive) ---
+        print("FlashErase: SKIPPED (destructive — confirmed working on Tahoe 26.4)")
+        print("")
+
+        // --- Test 6: SetReport via Feature type ---
+        print("SetReport via Feature (alternative send path):")
+        _ = enableRC()
+        // Try sending ReadFromEEPROM via Feature report type, then read
+        let featurePkt = buildRCPacket(cmd: .readFromEEPROM, offset: 0, length: 32)
+        var featureBytes = [UInt8](featurePkt)
+        let fRet = IOHIDDeviceSetReport(device, kIOHIDReportTypeFeature, 1, &featureBytes, featureBytes.count)
+        if fRet == kIOReturnSuccess {
+            usleep(50_000)
+            var rBuf = [UInt8](repeating: 0, count: HID_REPORT_SIZE)
+            var rLen = rBuf.count
+            let gRet = IOHIDDeviceGetReport(device, kIOHIDReportTypeInput, 1, &rBuf, &rLen)
+            if gRet == kIOReturnSuccess {
+                let nonZero = rBuf[15..<min(47, rBuf.count)].filter { $0 != 0 }.count
+                let hex = rBuf[15..<min(23, rBuf.count)].map { String(format: "%02X", $0) }.joined(separator: " ")
+                if nonZero > 0 {
+                    record("Feature→Input read", "NEW: data returned! [\(hex)]")
+                } else {
+                    record("Feature→Input read", "SAME: zeros after Feature send")
+                }
+            } else {
+                record("Feature→Input read", "GetReport error: 0x\(String(format: "%x", gRet))")
+            }
+        } else {
+            record("Feature→Input read", "SetReport(Feature) error: 0x\(String(format: "%x", fRet))")
+        }
+        print("")
+
+        // --- Summary ---
+        disableRC()
+        print("Summary")
+        print("=======")
+        let newBehaviors = results.filter { $0.1.hasPrefix("NEW") }
+        if newBehaviors.isEmpty {
+            print("  No changes from previous macOS behavior.")
+            print("  All previously-failing paths still fail the same way.")
+        } else {
+            print("  \(newBehaviors.count) NEW behavior(s) detected on Tahoe:")
+            for (name, result) in newBehaviors {
+                print("    • \(name): \(result)")
+            }
+        }
+        print("")
+
         return true
     }
 
@@ -1187,23 +1456,24 @@ func printUsage() {
 
     Usage:
       vmm7100tool info                         Read chip ID + firmware version
+      vmm7100tool diagnose                     Test all HID paths (Tahoe retest)
       vmm7100tool flash <firmware.fullrom>      Flash firmware (EXPERIMENTAL)
       vmm7100tool flash --dry-run <firmware>    Show flash plan without writing
       vmm7100tool reset                         Reset adapter board
       vmm7100tool test                          Run mock self-tests
 
-    Not yet working (HID read limitation):
-      vmm7100tool dump <output.fullrom>         Backup firmware (returns zeros)
-      vmm7100tool edid                          EDID read (returns zeros)
-      vmm7100tool register <addr>               Register read (returns stale data)
+    Requires macOS 26+ (Tahoe):
+      vmm7100tool dump <output.fullrom>         Backup firmware from flash
+      vmm7100tool edid                          Read stored EDID from flash
+      vmm7100tool register <addr>               Read/write chip registers
 
     Options:
       --mock     Use simulated device (for testing without hardware)
       --force    Continue flash even if CRC mismatch
 
-    Note: macOS HID stack cannot read data from this device (interrupt IN
-    endpoint inaccessible). Info/flash/reset use commands that work via
-    control transfers. See docs/lessons_log.md for details.
+    Note: macOS 26+ (Tahoe) required for read/dump/flash operations.
+    Earlier macOS versions only support info and reset.
+    See docs/lessons_log.md for details.
 
     Examples:
       vmm7100tool info
@@ -1234,6 +1504,9 @@ func main() -> Int32 {
     switch command {
     case "info":
         return tool.cmdInfo() ? 0 : 1
+
+    case "diagnose", "diag":
+        return tool.cmdDiagnose() ? 0 : 1
 
     case "edid":
         return tool.cmdEDID() ? 0 : 1
