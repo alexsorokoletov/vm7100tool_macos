@@ -659,6 +659,9 @@ class VMM7100Tool {
     // MARK: EDID command
 
     func cmdEDID() -> Bool {
+        if !isMock {
+            printErr("WARNING: edid does not work on real hardware — HID reads return zeros.")
+        }
         guard connect() else { return false }
         defer { disconnect() }
         guard enableRC() else { printErr("Failed to enable RC"); return false }
@@ -706,6 +709,9 @@ class VMM7100Tool {
     // MARK: Register command
 
     func cmdRegister(address: UInt32, writeValue: UInt32? = nil) -> Bool {
+        if !isMock && writeValue == nil {
+            printErr("WARNING: register reads do not work on real hardware — HID returns stale data.")
+        }
         guard connect() else { return false }
         defer { disconnect() }
         guard enableRC() else { printErr("Failed to enable RC"); return false }
@@ -752,6 +758,10 @@ class VMM7100Tool {
 
     /// Dump firmware. If already connected with RC enabled, pass standalone=false.
     func cmdDump(outputPath: String, standalone: Bool = true) -> Bool {
+        if standalone && !isMock {
+            printErr("WARNING: dump does not work on real hardware — HID reads return zeros.")
+            printErr("See docs/lessons_log.md for details.")
+        }
         if standalone {
             guard connect() else { return false }
             guard enableRC() else { printErr("Failed to enable RC"); disconnect(); return false }
@@ -1177,25 +1187,29 @@ func printUsage() {
     vmm7100tool — macOS firmware tool for VMM7100 USB-C to HDMI adapter
 
     Usage:
-      vmm7100tool info                         Read adapter & display info
-      vmm7100tool flash <firmware.fullrom>      Flash firmware
+      vmm7100tool info                         Read chip ID + firmware version
+      vmm7100tool flash <firmware.fullrom>      Flash firmware (EXPERIMENTAL)
       vmm7100tool flash --dry-run <firmware>    Show flash plan without writing
-      vmm7100tool dump <output.fullrom>         Backup current firmware
       vmm7100tool reset                         Reset adapter board
-      vmm7100tool edid                          Dump EDID information
-      vmm7100tool register <addr>               Read register (hex address)
-      vmm7100tool register <addr> <value>       Write register (hex address & value)
       vmm7100tool test                          Run mock self-tests
+
+    Not yet working (HID read limitation):
+      vmm7100tool dump <output.fullrom>         Backup firmware (returns zeros)
+      vmm7100tool edid                          EDID read (returns zeros)
+      vmm7100tool register <addr>               Register read (returns stale data)
 
     Options:
       --mock     Use simulated device (for testing without hardware)
       --force    Continue flash even if CRC mismatch
 
+    Note: macOS HID stack cannot read data from this device (interrupt IN
+    endpoint inaccessible). Info/flash/reset use commands that work via
+    control transfers. See docs/lessons_log.md for details.
+
     Examples:
       vmm7100tool info
-      vmm7100tool dump backup.fullrom
+      vmm7100tool flash --dry-run firmware.fullrom
       vmm7100tool flash Spyder_fw_USBC_CMforMac4K120hz.fullrom
-      vmm7100tool register 0x507
     """)
 }
 
