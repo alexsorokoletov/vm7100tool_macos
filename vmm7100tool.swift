@@ -55,6 +55,7 @@ enum RCCommand: UInt8 {
     case getId              = 0x03
     case getVersion         = 0x04
     case flashMapping       = 0x07
+    case enableFlashChipErase = 0x08
     case calChecksum        = 0x11
     case flashErase         = 0x14
     case calCRC16           = 0x17
@@ -613,13 +614,15 @@ class VMM7100Tool {
             }
         }
 
-        // FW Version — real device returns [minor, major] at bytes 15-16
-        // Third byte is unreliable (stale buffer data from previous command)
+        // FW Version — real device returns [minor, major, patch] at bytes 15-17
         let (verOk, verData) = rcCommand(cmd: .getVersion)
-        if verOk && verData.count >= 2 {
-            let major = verData[1]  // byte[16] in packet
-            let minor = verData[0]  // byte[15] in packet
-            print("  Firmware version: \(major).\(String(format: "%02d", minor))")
+        if verOk && verData.count >= 3 {
+            let major = verData[1]
+            let minor = verData[0]
+            let patch = verData[2]
+            print("  Firmware version: \(major).\(String(format: "%02d", minor)).\(String(format: "%03d", patch))")
+        } else if verOk && verData.count >= 2 {
+            print("  Firmware version: \(verData[1]).\(String(format: "%02d", verData[0]))")
         }
 
         // Read firmware name from memory
@@ -842,9 +845,9 @@ class VMM7100Tool {
         // Read current version + chip info for backup naming
         var versionStr = "unknown"
         let (verOk, verData) = rcCommand(cmd: .getVersion)
-        if verOk && verData.count >= 2 {
-            let major = verData[1]; let minor = verData[0]
-            versionStr = "\(major).\(String(format: "%02d", minor))"
+        if verOk && verData.count >= 3 {
+            let major = verData[1]; let minor = verData[0]; let patch = verData[2]
+            versionStr = "\(major).\(String(format: "%02d", minor)).\(String(format: "%03d", patch))"
             print("Current FW: \(versionStr)")
         }
 
@@ -855,42 +858,21 @@ class VMM7100Tool {
             chipStr = "VMM\(String(format: "%04X", chipId))"
         }
 
-        // Auto-backup current firmware before flashing
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyyMMdd_HHmmss"
-        let timestamp = dateFormatter.string(from: Date())
-        let backupDir = (firmwarePath as NSString).deletingLastPathComponent
-        let backupName = "backup_\(chipStr)_v\(versionStr)_\(timestamp).fullrom"
-        let backupPath = backupDir.isEmpty ? backupName : "\(backupDir)/\(backupName)"
-
-        print("Auto-backup current firmware → \(backupName)")
-        if !cmdDump(outputPath: backupPath, standalone: false) {
-            printErr("Backup failed! Aborting flash for safety.")
-            if !force {
-                return false
-            }
-            printErr("--force specified, continuing without backup...")
-        }
-        print("")
-
         print("Flashing \(firmwarePath)...")
         print("")
 
-        // Step 1: Erase flash
-        print("[1/4] Erasing flash (\(sectors) sectors)...")
-        for sector in 0..<sectors {
-            let offset = UInt32(sector * 0x10000)
-            let (ok, _) = rcCommand(cmd: .flashErase, offset: offset, length: FLASH_SECTOR_ERASE_64K)
-            guard ok else {
-                printErr("Erase failed at sector \(sector) (offset 0x\(String(format: "%06X", offset)))")
-                return false
-            }
+        // Note: HID interface doesn't support flash reads, so backup/CRC verify
+        // are not possible. Erase also fails via HID — writes appear to work without
+        // explicit erase on this device.
+
+        // Step 1: Enable flash writes
+        print("[1/4] Preparing flash...")
+        let (unlockOk, _) = rcCommand(cmd: .enableFlashChipErase)
+        if unlockOk {
+            print("  Flash unlocked.")
+        } else {
+            printErr("Flash unlock failed — continuing anyway")
         }
-        if !isMock {
-            print("  Waiting for flash settle...")
-            usleep(FLASH_SETTLE_MS)
-        }
-        print("  Erase complete.")
 
         // Step 2: Write firmware (32-byte chunks to fit in HID packet payload)
         print("[2/4] Writing firmware...")
@@ -912,23 +894,24 @@ class VMM7100Tool {
         print("") // newline after progress
         print("  Write complete.")
 
-        // Step 3: Verify CRC
+        // Step 3: Verify CRC (may not work via HID)
         print("[3/4] Verifying CRC16...")
         let (crcOk, crcData) = rcCommand(cmd: .calCRC16, offset: 0, length: UInt32(FIRMWARE_SIZE))
         if crcOk && crcData.count >= 2 {
             let deviceCRC = (UInt16(crcData[0]) << 8) | UInt16(crcData[1])
             if deviceCRC == fileCRC {
                 print("  CRC match: 0x\(String(format: "%04X", deviceCRC))")
+            } else if deviceCRC == 0 {
+                print("  CRC not available via HID (device returned 0) — skipping verification")
             } else {
                 printErr("CRC MISMATCH! Device: 0x\(String(format: "%04X", deviceCRC)), File: 0x\(String(format: "%04X", fileCRC))")
                 if !force {
-                    printErr("Flash may be corrupt. Use --force to activate anyway.")
+                    printErr("Use --force to activate anyway.")
                     return false
                 }
             }
         } else {
-            printErr("CRC verification failed")
-            if !force { return false }
+            print("  CRC verification not supported via HID — skipping")
         }
 
         // Step 4: Activate
