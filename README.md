@@ -62,7 +62,10 @@ No DP Alt Mode required — communication happens over USB data pins, not Displa
 ## Status
 
 - Mock tests: 23/23 passing
-- Real device testing: pending (protocol packet format may need adjustment based on actual device responses)
+- Real device: `info` verified (VMM7100, FW 7.02, rev D9)
+- `edid`, `register`, `dump` — HID interface only supports getId/getVersion/write commands; read operations (ReadFromEEPROM, ReadFromMemory) return empty data via HID. These require DP AUX channel which isn't available on macOS without kernel driver support.
+- `flash` — write commands untested on real device yet (uses writeToEEPROM which may work since VmmHIDTool.exe does flash via HID on Windows)
+- `reset` — uses known-good packets from vmm7100reset.swift
 
 ## License
 

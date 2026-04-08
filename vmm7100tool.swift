@@ -613,13 +613,13 @@ class VMM7100Tool {
             }
         }
 
-        // FW Version — real device returns [minor, major, ...] at bytes 15+
+        // FW Version — real device returns [minor, major] at bytes 15-16
+        // Third byte is unreliable (stale buffer data from previous command)
         let (verOk, verData) = rcCommand(cmd: .getVersion)
         if verOk && verData.count >= 2 {
             let major = verData[1]  // byte[16] in packet
             let minor = verData[0]  // byte[15] in packet
-            let patch: UInt8 = verData.count >= 3 ? verData[2] : 0
-            print("  Firmware version: \(major).\(String(format: "%02d", minor)).\(String(format: "%03d", patch))")
+            print("  Firmware version: \(major).\(String(format: "%02d", minor))")
         }
 
         // Read firmware name from memory
@@ -844,8 +844,7 @@ class VMM7100Tool {
         let (verOk, verData) = rcCommand(cmd: .getVersion)
         if verOk && verData.count >= 2 {
             let major = verData[1]; let minor = verData[0]
-            let patch: UInt8 = verData.count >= 3 ? verData[2] : 0
-            versionStr = "\(major).\(String(format: "%02d", minor)).\(String(format: "%03d", patch))"
+            versionStr = "\(major).\(String(format: "%02d", minor))"
             print("Current FW: \(versionStr)")
         }
 
