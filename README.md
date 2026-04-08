@@ -81,9 +81,33 @@ No DP Alt Mode required — communication happens over USB data pins, not Displa
 - `flash` — erase fails (error 3), writes are no-ops without erase
 
 ### What still doesn't work (any macOS version)
-- `ReadFromMemory` (register reads) — returns error code 1 with stale buffer data
+- `ReadFromMemory` at low addresses (0x0-0xFFFF, DPCD-mapped) — returns error code 1
+- `ReadFromMemory` at high addresses (0x20000000+, 0x90000000+) — **works on Tahoe** (board ID, reset reg)
 - Interrupt IN endpoint callback — never fires
 - These limitations don't affect core functionality (flash/dump/info)
+
+## Screenshots
+
+### Adapter Info
+![info](docs/info.webp)
+
+### Firmware Flash
+![flash](docs/flash.webp)
+
+### Flash Dry Run
+![flash-dryrun](docs/flash-dryrun.webp)
+
+### Firmware Dump
+![dump](docs/dump.webp)
+
+### Connected Display (EDID decode)
+![display](docs/display.webp)
+
+### Stored EDID
+![edid](docs/edid.webp)
+
+### Help
+![help](docs/help.webp)
 
 ## License
 

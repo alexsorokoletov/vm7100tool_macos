@@ -605,8 +605,31 @@ class VMM7100Tool {
         }
         defer { disableRC() }
 
+        // Read USB device info from IORegistry
+        func ioregValue(_ key: String) -> String? {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+            proc.arguments = ["-c", "ioreg -l -w0 | grep -m1 '\"\(key)\"' | sed 's/.*= //;s/\"//g;s/ *$//'"]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = Pipe()
+            try? proc.run()
+            proc.waitUntilExit()
+            let val = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return val?.isEmpty == true ? nil : val
+        }
+
+        let usbVendor = ioregValue("USB Vendor Name") ?? ""
+        let usbSerial = ioregValue("USB Serial Number") ?? ""
+
         print("VMM7100 Adapter Info")
         print("====================")
+        if !usbVendor.isEmpty {
+            print("  USB vendor:       \(usbVendor)")
+        }
+        if !usbSerial.isEmpty && usbSerial != "000000000000" {
+            print("  USB serial:       \(usbSerial)")
+        }
 
         // Chip ID — little-endian from device
         let (idOk, idData) = rcCommand(cmd: .getId)
@@ -616,6 +639,23 @@ class VMM7100Tool {
             if idData.count >= 3 {
                 let rev = idData[2]
                 print("  Chip revision:    \(String(format: "%c%d", 0x40 + (rev >> 4), rev & 0x0F))")
+            }
+        }
+
+        // Board/Customer ID — Spyder uses register 0x9000020E (requires Tahoe)
+        let (boardOk, boardData) = rcCommand(cmd: .readFromMemory, offset: 0x9000020E, length: 2)
+        if boardOk && boardData.count >= 2 {
+            let boardId = UInt16(boardData[0]) | (UInt16(boardData[1]) << 8)
+            if boardId != 0 {
+                print("  Board ID:         0x\(String(format: "%04X", boardId))")
+            }
+        }
+        // Additional board info at 0x90000210
+        let (extraOk, extraData) = rcCommand(cmd: .readFromMemory, offset: 0x90000210, length: 2)
+        if extraOk && extraData.count >= 2 {
+            let extraId = UInt16(extraData[0]) | (UInt16(extraData[1]) << 8)
+            if extraId != 0 {
+                print("  Board revision:   0x\(String(format: "%04X", extraId))")
             }
         }
 
@@ -635,31 +675,28 @@ class VMM7100Tool {
             }
         }
 
-        // Read firmware name from memory
-        let (nameOk, nameData) = rcCommand(cmd: .readFromMemory, offset: 0x100, length: 32)
+        // Read firmware name from EEPROM
+        // Name is at 0x2F1 (0x2F0 has a junk prefix byte), truncated "Spyder_fw_..."
+        let (nameOk, nameData) = rcCommand(cmd: .readFromEEPROM, offset: 0x2F1, length: 31)
         if nameOk && !nameData.isEmpty {
-            if let name = String(data: nameData.prefix(while: { $0 != 0 }), encoding: .ascii), !name.isEmpty {
-                print("  Firmware name:    \(name)")
+            if let name = String(data: nameData.prefix(while: { $0 >= 0x20 && $0 < 0x7F }), encoding: .ascii), name.count >= 4 {
+                let displayName = name.hasPrefix("der_fw_") ? "Spy" + name : name
+                print("  Firmware name:    \(displayName)")
             }
         }
 
-        // Read EDID info
+        // Read stored EDID from flash
         let (edidOk, edidData) = rcCommand(cmd: .readFromEEPROM, offset: 0, length: 128)
         if edidOk && edidData.count >= 128, let edid = parseEDID(edidData) {
             print("")
-            print("Connected Display")
-            print("-----------------")
+            print("Stored EDID (adapter flash)")
+            print("---------------------------")
             print("  Manufacturer:     \(edid.manufacturer)")
             if !edid.productName.isEmpty {
                 print("  Product name:     \(edid.productName)")
             }
-            print("  Product ID:       \(String(format: "0x%04X", edid.productID))")
-            if edid.serial != 0 {
-                print("  Serial:           \(edid.serial)")
-            }
-            print("  Manufacture date: Week \(edid.week), \(edid.year)")
             if edid.hRes > 0 && edid.vRes > 0 {
-                print("  Native resolution: \(edid.hRes)x\(edid.vRes)")
+                print("  Max resolution:   \(edid.hRes)x\(edid.vRes)")
             }
         }
 
@@ -711,6 +748,233 @@ class VMM7100Tool {
         }
 
         return true
+    }
+
+    // MARK: Display command — read connected monitor EDID from IORegistry
+
+    func cmdDisplay() -> Bool {
+        // Read EDID from IORegistry (no device connection needed)
+        // Use ioreg to find EDID data
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        proc.arguments = ["-c", """
+import subprocess, json, re, struct, sys
+
+# Get EDID from ioreg
+result = subprocess.run(["ioreg", "-l", "-w0"], capture_output=True, text=True)
+edid_hex = None
+product_name = None
+for line in result.stdout.split("\\n"):
+    if '"EDID" = <' in line and "Metadata" not in line and "UUID" not in line:
+        m = re.search(r'"EDID"\\s*=\\s*<([0-9a-f]+)>', line)
+        if m:
+            edid_hex = m.group(1)
+            break
+
+if not edid_hex:
+    print("No display EDID found in IORegistry.")
+    print("Is a monitor connected?")
+    sys.exit(1)
+
+edid = bytes.fromhex(edid_hex)
+base = edid[:128]
+ext = edid[128:256] if len(edid) > 128 else None
+
+# Verify header
+if base[:8] != bytes([0,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0]):
+    print("Invalid EDID header")
+    sys.exit(1)
+
+# Manufacturer
+mfg = (base[8] << 8) | base[9]
+mfg_str = ''.join(chr(((mfg >> s) & 0x1F) + 0x40) for s in [10,5,0])
+prod = base[10] | (base[11] << 8)
+serial = struct.unpack_from('<I', base, 12)[0]
+
+print("Connected Display")
+print("=" * 50)
+print(f"  Manufacturer:      {mfg_str}")
+print(f"  Product code:      0x{prod:04X}")
+print(f"  Serial:            {serial}")
+print(f"  Manufacture date:  Week {base[16]}, {base[17]+1990}")
+print(f"  EDID version:      {base[18]}.{base[19]}")
+
+b20 = base[20]
+if b20 & 0x80:
+    depth_map = {0:"undefined",1:"6-bit",2:"8-bit",3:"10-bit",4:"12-bit",5:"14-bit",6:"16-bit"}
+    iface_map = {0:"undefined",1:"DVI",2:"HDMIa",3:"HDMIb",4:"MDDI",5:"DisplayPort"}
+    print(f"  Input:             Digital, {depth_map.get((b20>>4)&7,'?')}, {iface_map.get(b20&0xF,'?')}")
+h,v = base[21], base[22]
+if h and v:
+    diag = (h**2 + v**2)**0.5 / 2.54
+    print(f"  Screen size:       {h}x{v} cm (~{diag:.0f}\\" diagonal)")
+print(f"  Gamma:             {(base[23]+100)/100:.2f}")
+
+# Established timings
+est = [(35,0x80,"720x400@70"),(35,0x40,"720x400@88"),(35,0x20,"640x480@60"),
+       (35,0x10,"640x480@67"),(35,0x08,"640x480@72"),(35,0x04,"640x480@75"),
+       (35,0x02,"800x600@56"),(35,0x01,"800x600@60"),(36,0x80,"800x600@72"),
+       (36,0x40,"800x600@75"),(36,0x20,"832x624@75"),(36,0x10,"1024x768@87i"),
+       (36,0x08,"1024x768@60"),(36,0x04,"1024x768@70"),(36,0x02,"1024x768@75"),
+       (36,0x01,"1280x1024@75"),(37,0x80,"1152x870@75")]
+modes = [n for b,m,n in est if base[b]&m]
+if modes:
+    print(f"\\nEstablished Timings:")
+    print(f"  {', '.join(modes)}")
+
+# Standard timings
+aspect_map = {0:(16,10),1:(4,3),2:(5,4),3:(16,9)}
+stds = []
+for i in range(8):
+    b1,b2 = base[38+i*2],base[39+i*2]
+    if b1==1 and b2==1: continue
+    hp=(b1+31)*8; ar=aspect_map.get((b2>>6)&3,(16,9)); vp=hp*ar[1]//ar[0]; r=(b2&0x3F)+60
+    stds.append(f"{hp}x{vp}@{r}")
+if stds:
+    print(f"\\nStandard Timings:")
+    for s in stds: print(f"  {s}")
+
+# Detailed descriptors
+print(f"\\nDetailed Descriptors:")
+for block in range(4):
+    off = 54 + block * 18
+    pc = base[off] | (base[off+1] << 8)
+    if pc == 0:
+        tag = base[off+3]
+        data = bytes(base[off+5:off+18])
+        text = data.decode('ascii',errors='replace').strip('\\n\\r\\x0a ')
+        if tag == 0xFD:
+            print(f"  Range:           V={base[off+5]}-{base[off+6]}Hz  H={base[off+7]}-{base[off+8]}kHz  Max pixel clock={base[off+9]*10}MHz")
+        elif tag == 0xFC: print(f"  Monitor name:    {text}")
+        elif tag == 0xFF: print(f"  Serial string:   {text}")
+        elif tag == 0xFE: print(f"  Text:            {text}")
+    else:
+        pc_mhz = pc * 0.01
+        ha = base[off+2]|((base[off+4]&0xF0)<<4)
+        hb = base[off+3]|((base[off+4]&0x0F)<<8)
+        va = base[off+5]|((base[off+7]&0xF0)<<4)
+        vb = base[off+6]|((base[off+7]&0x0F)<<8)
+        ht,vt = ha+hb, va+vb
+        ref = pc_mhz*1e6/(ht*vt) if ht*vt else 0
+        il = "i" if base[off+17]&0x80 else "p"
+        print(f"  Preferred mode:  {ha}x{va} @ {ref:.1f}Hz{il}  ({pc_mhz:.2f} MHz)")
+
+# CTA Extension
+if ext and ext[0] == 0x02:
+    print(f"\\nCTA-861 Extension:")
+    dtd_start = ext[2]
+    off = 4
+    while off < dtd_start and off < len(ext):
+        tag = (ext[off] >> 5) & 7
+        length = ext[off] & 0x1F
+        if off + 1 + length > len(ext): break
+
+        if tag == 2:  # Video SVDs
+            vic_modes = {
+                1:"640x480@60",2:"720x480@60",3:"720x480@60",4:"1280x720@60",
+                5:"1920x1080@60i",16:"1920x1080@60",17:"720x576@50",
+                19:"1280x720@50",20:"1920x1080@50i",31:"1920x1080@50",
+                32:"1920x1080@24",33:"1920x1080@25",34:"1920x1080@30",
+                47:"1280x720@120",63:"1920x1080@120",93:"3840x2160@24",
+                94:"3840x2160@25",95:"3840x2160@30",96:"3840x2160@50",
+                97:"3840x2160@60",107:"3840x2160@120",118:"3840x2160@100",
+                120:"5120x2160@60",127:"5120x2880@60",
+            }
+            print(f"  Video modes:")
+            for i in range(length):
+                svd = ext[off+1+i]
+                native = " *" if svd & 0x80 else ""
+                vic = svd & 0x7F
+                mode = vic_modes.get(vic, f"VIC {vic}")
+                print(f"    {mode}{native}")
+
+        elif tag == 1:  # Audio
+            fmt_names = {1:"LPCM",2:"AC-3",3:"MPEG1",4:"MP3",6:"AAC-LC",7:"DTS",
+                        10:"E-AC-3",11:"DTS-HD",12:"TrueHD"}
+            print(f"  Audio:")
+            for i in range(0, length, 3):
+                if off+1+i+2 >= len(ext): break
+                fmt = (ext[off+1+i] >> 3) & 0x0F
+                ch = (ext[off+1+i] & 0x07) + 1
+                rates = ext[off+2+i]
+                rl = []
+                for bit,khz in enumerate(["32","44.1","48","88.2","96","176.4","192"]):
+                    if rates & (1<<bit): rl.append(khz)
+                bits = ext[off+3+i]
+                bd = []
+                if fmt == 1:  # LPCM
+                    if bits & 1: bd.append("16-bit")
+                    if bits & 2: bd.append("20-bit")
+                    if bits & 4: bd.append("24-bit")
+                print(f"    {fmt_names.get(fmt,f'Fmt{fmt}')}: {ch}ch [{', '.join(rl)}kHz] {', '.join(bd)}")
+
+        elif tag == 3:  # Vendor specific
+            oui = ext[off+1] | (ext[off+2]<<8) | (ext[off+3]<<16)
+            if oui == 0x000C03:
+                tmds = ext[off+7]*5 if length >= 7 else 0
+                flags = ext[off+6] if length >= 6 else 0
+                dc = []
+                if flags & 0x10: dc.append("30-bit")
+                if flags & 0x20: dc.append("36-bit")
+                if flags & 0x40: dc.append("48-bit")
+                print(f"  HDMI 1.4:        Max TMDS {tmds}MHz, Deep Color: {', '.join(dc) if dc else 'No'}")
+            elif oui == 0xC45DD8:
+                max_t = ext[off+5]*5 if length >= 5 else 0
+                flags1 = ext[off+6] if length >= 6 else 0
+                frl = (ext[off+7] >> 4) & 0x0F if length >= 7 else 0
+                frl_map = {0:"None",1:"3L@3G",2:"3L@6G",3:"4L@6G",4:"4L@8G",5:"4L@10G",6:"4L@12G"}
+                scdc = "Yes" if flags1 & 0x80 else "No"
+                dsc = "Yes" if (ext[off+7] & 0x80) else "No" if length >= 7 else "?"
+                vrr_min = ext[off+8] & 0x3F if length >= 8 else 0
+                vrr_max = (((ext[off+8]>>6)&3)<<8 | ext[off+9]) if length >= 9 else 0
+                hdmi_ver = "HDMI 2.1" if frl > 0 else "HDMI 2.0"
+                print(f"  {hdmi_ver}:         Max TMDS {max_t}MHz, SCDC={scdc}, FRL={frl_map.get(frl,'?')}")
+                if vrr_max: print(f"                   VRR {vrr_min}-{vrr_max}Hz, DSC={dsc}")
+                elif dsc == "Yes": print(f"                   DSC={dsc}")
+
+        off += 1 + length
+
+    # Extension DTDs
+    off = dtd_start
+    ext_timings = []
+    while off + 17 < len(ext):
+        pc = ext[off] | (ext[off+1] << 8)
+        if pc == 0: break
+        pc_mhz = pc * 0.01
+        ha = ext[off+2]|((ext[off+4]&0xF0)<<4)
+        va = ext[off+5]|((ext[off+7]&0xF0)<<4)
+        hb = ext[off+3]|((ext[off+4]&0x0F)<<8)
+        vb = ext[off+6]|((ext[off+7]&0x0F)<<8)
+        ht,vt = ha+hb,va+vb
+        ref = pc_mhz*1e6/(ht*vt) if ht*vt else 0
+        il = "i" if ext[off+17]&0x80 else "p"
+        ext_timings.append(f"{ha}x{va} @ {ref:.1f}Hz{il}  ({pc_mhz:.2f} MHz)")
+        off += 18
+    if ext_timings:
+        print(f"  Extra timings:")
+        for t in ext_timings: print(f"    {t}")
+
+cksum = sum(base[:128]) & 0xFF
+print(f"\\nChecksum:            {'valid' if cksum == 0 else 'INVALID'}")
+"""]
+        let pipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = errPipe
+        try? proc.run()
+        proc.waitUntilExit()
+
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let errOutput = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        if !output.isEmpty {
+            print(output, terminator: "")
+        }
+        if !errOutput.isEmpty && output.isEmpty {
+            printErr(errOutput)
+        }
+
+        return proc.terminationStatus == 0
     }
 
     // MARK: Register command
@@ -888,12 +1152,10 @@ class VMM7100Tool {
         print("Flashing \(firmwarePath)...")
         print("")
 
-        // Note: HID interface doesn't support flash reads, so backup/CRC verify
-        // are not possible. Erase also fails via HID — writes appear to work without
-        // explicit erase on this device.
+        // Flash sequence from fwupd: unlock → erase → write → verify → activate
 
-        // Step 1: Enable flash writes
-        print("[1/4] Preparing flash...")
+        // Step 1: Enable flash chip erase
+        print("[1/5] Preparing flash...")
         let (unlockOk, _) = rcCommand(cmd: .enableFlashChipErase)
         if unlockOk {
             print("  Flash unlocked.")
@@ -901,8 +1163,21 @@ class VMM7100Tool {
             printErr("Flash unlock failed — continuing anyway")
         }
 
-        // Step 2: Write firmware (32-byte chunks to fit in HID packet payload)
-        print("[2/4] Writing firmware...")
+        // Step 2: Full chip erase (fwupd: offset=0, data=[0xFF,0xFF])
+        print("[2/5] Erasing flash...")
+        let eraseData = Data([0xFF, 0xFF])
+        let (eraseOk, _) = rcCommand(cmd: .flashErase, offset: 0, length: UInt32(eraseData.count), data: eraseData)
+        if eraseOk {
+            print("  Erase command accepted. Waiting 5s for completion...")
+            usleep(5_000_000) // 5 seconds — fwupd uses this settle time
+            print("  Erase complete.")
+        } else {
+            printErr("Flash erase failed. Requires macOS 26+ (Tahoe).")
+            return false
+        }
+
+        // Step 3: Write firmware (32-byte chunks to fit in HID packet payload)
+        print("[3/5] Writing firmware...")
         let writeChunk = Int(UNIT_SIZE) // 32 bytes fits in single HID packet
         let totalChunks = FIRMWARE_SIZE / writeChunk
         for chunk in 0..<totalChunks {
@@ -921,8 +1196,8 @@ class VMM7100Tool {
         print("") // newline after progress
         print("  Write complete.")
 
-        // Step 3: Verify CRC (may not work via HID)
-        print("[3/4] Verifying CRC16...")
+        // Step 4: Verify CRC
+        print("[4/5] Verifying CRC16...")
         let (crcOk, crcData) = rcCommand(cmd: .calCRC16, offset: 0, length: UInt32(FIRMWARE_SIZE))
         if crcOk && crcData.count >= 2 {
             let deviceCRC = (UInt16(crcData[0]) << 8) | UInt16(crcData[1])
@@ -941,8 +1216,8 @@ class VMM7100Tool {
             print("  CRC verification not supported via HID — skipping")
         }
 
-        // Step 4: Activate
-        print("[4/4] Activating firmware...")
+        // Step 5: Activate
+        print("[5/5] Activating firmware...")
         let (actOk, _) = rcCommand(cmd: .activateFirmware)
         guard actOk else {
             printErr("Failed to activate firmware")
@@ -1465,6 +1740,7 @@ func printUsage() {
     Requires macOS 26+ (Tahoe):
       vmm7100tool dump <output.fullrom>         Backup firmware from flash
       vmm7100tool edid                          Read stored EDID from flash
+      vmm7100tool display                       Decode connected monitor EDID
       vmm7100tool register <addr>               Read/write chip registers
 
     Options:
@@ -1510,6 +1786,9 @@ func main() -> Int32 {
 
     case "edid":
         return tool.cmdEDID() ? 0 : 1
+
+    case "display":
+        return tool.cmdDisplay() ? 0 : 1
 
     case "register", "reg":
         guard filteredArgs.count >= 2, let addr = parseHex(filteredArgs[1]) else {
