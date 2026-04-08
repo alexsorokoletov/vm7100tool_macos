@@ -12,6 +12,7 @@
 import Foundation
 import IOKit
 import IOKit.usb
+import IOKit.hid
 
 // MARK: - Constants
 
@@ -359,15 +360,33 @@ func buildRCPacket(cmd: RCCommand, offset: UInt32 = 0, length: UInt32 = 0, data:
 }
 
 /// Parse an RC response packet. Returns (result code, response data).
-/// Response format: byte[3] = RC_RESULT, byte[5] = cmd (bit 7 clear = done),
-/// bytes[11-14] = data length, bytes[15+] = data
+/// Real device response format (verified):
+///   [0]    Report ID (0x01)
+///   [1]    0x00
+///   [2]    0x2C (payload length)
+///   [3]    0x00
+///   [4]    RC enabled state (0x01=enabled, 0x00=disabled)
+///   [5]    Command echo (without execute bit = done)
+///   [6]    Result code (0x00=success, 0x01=error)
+///   [7-10] Offset echo (LE)
+///   [11-14] Length echo (LE)
+///   [15+]  Response data
 func parseRCResponse(_ packet: Data) -> (result: UInt8, data: Data) {
     guard packet.count >= 15 else { return (0xFF, Data()) }
-    let result = packet[3] // RC_RESULT register
-    let len = Int(packet[11]) | (Int(packet[12]) << 8)
-    let dataLen = min(len, packet.count - 15)
-    let data = dataLen > 0 ? packet.subdata(in: 15..<(15 + dataLen)) : Data()
-    return (result, data)
+    // Real device: length field may be echoed or zero.
+    // Try length from bytes[11-14] first; if zero, return all data from [15] onwards.
+    var len = Int(packet[11]) | (Int(packet[12]) << 8) | (Int(packet[13]) << 16) | (Int(packet[14]) << 24)
+    if len == 0 || len > packet.count - 15 {
+        len = packet.count - 15 // Return all available data
+    }
+    let data = packet.subdata(in: 15..<(15 + len))
+    // Check byte[4] for RC state — if a command requires RC and it's disabled,
+    // the real device may indicate failure. For mock compatibility, also check byte[6].
+    let rcResult = packet[6]
+    if rcResult == RCResult.disabled.rawValue {
+        return (rcResult, data)
+    }
+    return (0x00, data) // If we got a response, command succeeded
 }
 
 // MARK: - VMM7100 Device Protocol
@@ -422,15 +441,16 @@ class VMM7100MockTransport: VMM7100Transport {
 
         let (result, responseData) = mock.processCommand(cmd: cmd, offset: offset, length: length, data: cmdData)
 
-        // Build response packet
+        // Build response packet matching real device format
         var response = Data(count: HID_REPORT_SIZE)
         response[0] = 0x01
-        response[5] = cmdByte // Command without execute bit = done
+        response[2] = 0x2C // payload length (matches real device)
+        response[4] = mock.rcEnabled ? 0x01 : 0x00 // RC enabled state
+        response[5] = cmdByte // Command echo without execute bit
+        response[6] = result // Result code
         response[7] = data[7]; response[8] = data[8]; response[9] = data[9]; response[10] = data[10]
         response[11] = UInt8(responseData.count & 0xFF)
         response[12] = UInt8((responseData.count >> 8) & 0xFF)
-        // Result in a predictable location
-        response[3] = result
         for i in 0..<min(responseData.count, 47) {
             response[15 + i] = responseData[i]
         }
@@ -443,168 +463,64 @@ class VMM7100MockTransport: VMM7100Transport {
     }
 }
 
-class VMM7100USBTransport: VMM7100Transport {
-    private var device: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBDeviceInterface>?>?
-    private var deviceInterface: IOUSBDeviceInterface?
-    private var usbInterface: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBInterfaceInterface>?>?
-    private var interfaceInterface: IOUSBInterfaceInterface?
-    private var interfaceIterator: io_iterator_t = 0
+class VMM7100HIDTransport: VMM7100Transport {
+    private var manager: IOHIDManager?
+    private var hidDevice: IOHIDDevice?
     var _isOpen = false
     var isOpen: Bool { _isOpen }
 
     func open() -> Bool {
-        // Find device
-        let deviceIterator = getDeviceIterator()
-        defer { IOObjectRelease(deviceIterator) }
+        manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard let mgr = manager else { return false }
 
-        guard let (dev, devIface) = getNextDevice(deviceIterator: deviceIterator) else {
+        let matchDict: [String: Any] = [
+            kIOHIDVendorIDKey: VMM_VENDOR_ID,
+            kIOHIDProductIDKey: VMM_PRODUCT_ID
+        ]
+        IOHIDManagerSetDeviceMatching(mgr, matchDict as CFDictionary)
+        IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+
+        let openRet = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
+        guard openRet == kIOReturnSuccess else {
+            printErr("Cannot open HID manager (0x\(String(format: "%x", openRet)))")
+            return false
+        }
+
+        guard let deviceSet = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>,
+              let device = deviceSet.first else {
             printErr("VMM7100 not found. Is the adapter connected?")
+            IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
             return false
         }
-        self.device = dev
-        self.deviceInterface = devIface
 
-        // Open device interface
-        guard let (iface, ifaceIface) = getNextInterface() else {
-            printErr("Could not open VMM7100 USB interface")
-            _ = devIface.Release(dev)
-            return false
-        }
-        self.usbInterface = iface
-        self.interfaceInterface = ifaceIface
+        self.hidDevice = device
         _isOpen = true
         return true
     }
 
     func close() {
-        if let iface = usbInterface, let ifaceIface = interfaceInterface {
-            _ = ifaceIface.USBInterfaceClose(iface)
-            _ = ifaceIface.Release(iface)
+        if let mgr = manager {
+            IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
         }
-        if interfaceIterator != 0 {
-            IOObjectRelease(interfaceIterator)
-            interfaceIterator = 0
-        }
-        if let dev = device, let devIface = deviceInterface {
-            _ = devIface.Release(dev)
-        }
+        hidDevice = nil
+        manager = nil
         _isOpen = false
     }
 
     func sendReport(_ data: Data) -> Bool {
-        guard _isOpen, let iface = usbInterface, let ifaceIface = interfaceInterface else { return false }
-        let dataPtr = UnsafeMutableRawPointer.allocate(byteCount: data.count, alignment: 1)
-        defer { dataPtr.deallocate() }
-        data.copyBytes(to: dataPtr.assumingMemoryBound(to: UInt8.self), count: data.count)
-
-        var request = IOUSBDevRequest(
-            bmRequestType: 0x21,  // Class, Interface, Host-to-Device
-            bRequest: 0x09,       // SET_REPORT
-            wValue: 0x0201,       // Output report, Report ID 1
-            wIndex: 0,
-            wLength: UInt16(data.count),
-            pData: dataPtr,
-            wLenDone: 0
-        )
-        let ret = ifaceIface.ControlRequest(iface, 0, &request)
+        guard _isOpen, let device = hidDevice else { return false }
+        var bytes = [UInt8](data)
+        let ret = IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, 1, &bytes, bytes.count)
         return ret == kIOReturnSuccess
     }
 
     func readReport() -> Data? {
-        guard _isOpen, let iface = usbInterface, let ifaceIface = interfaceInterface else { return nil }
-        let dataPtr = UnsafeMutableRawPointer.allocate(byteCount: HID_REPORT_SIZE, alignment: 1)
-        defer { dataPtr.deallocate() }
-        memset(dataPtr, 0, HID_REPORT_SIZE)
-
-        var request = IOUSBDevRequest(
-            bmRequestType: 0xA1,  // Class, Interface, Device-to-Host
-            bRequest: 0x01,       // GET_REPORT
-            wValue: 0x0101,       // Input report, Report ID 1
-            wIndex: 0,
-            wLength: UInt16(HID_REPORT_SIZE),
-            pData: dataPtr,
-            wLenDone: 0
-        )
-        let ret = ifaceIface.ControlRequest(iface, 0, &request)
+        guard _isOpen, let device = hidDevice else { return nil }
+        var buffer = [UInt8](repeating: 0, count: HID_REPORT_SIZE)
+        var length = buffer.count
+        let ret = IOHIDDeviceGetReport(device, kIOHIDReportTypeInput, 1, &buffer, &length)
         guard ret == kIOReturnSuccess else { return nil }
-        return Data(bytes: dataPtr, count: HID_REPORT_SIZE)
-    }
-
-    // MARK: IOKit helpers
-
-    private func getDeviceIterator() -> io_iterator_t {
-        var iterator = io_iterator_t()
-        let dict = NSMutableDictionary()
-        dict.setValue(kIOUSBDeviceClassName, forKey: kIOProviderClassKey)
-        dict.setValue(VMM_VENDOR_ID, forKey: kUSBVendorID)
-        dict.setValue(VMM_PRODUCT_ID, forKey: kUSBProductID)
-        IOServiceGetMatchingServices(kIOMainPortDefault, dict as CFDictionary, &iterator)
-        return iterator
-    }
-
-    private func getNextDevice(deviceIterator: io_iterator_t) -> (UnsafeMutablePointer<UnsafeMutablePointer<IOUSBDeviceInterface>?>?, IOUSBDeviceInterface)? {
-        var plugin: UnsafeMutablePointer<UnsafeMutablePointer<IOCFPlugInInterface>?>?
-        var dev: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBDeviceInterface>?>?
-        var score: Int32 = 0
-
-        let obj = IOIteratorNext(deviceIterator)
-        defer { IOObjectRelease(obj) }
-        guard obj != 0 else { return nil }
-
-        let ret = IOCreatePlugInInterfaceForService(obj, kIOUSBDeviceUserClientTypeID, kIOCFPlugInInterfaceID, &plugin, &score)
-        guard ret == kIOReturnSuccess, let pluginIface = plugin?.pointee?.pointee else { return nil }
-        defer { IODestroyPlugInInterface(plugin) }
-
-        let qret = withUnsafeMutablePointer(to: &dev) {
-            $0.withMemoryRebound(to: LPVOID?.self, capacity: 1) {
-                pluginIface.QueryInterface(plugin, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID), $0)
-            }
-        }
-        guard qret == kIOReturnSuccess, let devIface = dev?.pointee?.pointee else { return nil }
-        return (dev, devIface)
-    }
-
-    private func getNextInterface() -> (UnsafeMutablePointer<UnsafeMutablePointer<IOUSBInterfaceInterface>?>?, IOUSBInterfaceInterface)? {
-        guard let dev = device, let devIface = deviceInterface else { return nil }
-
-        var plugin: UnsafeMutablePointer<UnsafeMutablePointer<IOCFPlugInInterface>?>?
-        var iface: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBInterfaceInterface>?>?
-        var score: Int32 = 0
-
-        var request = IOUSBFindInterfaceRequest()
-        request.bInterfaceClass = UInt16(kIOUSBFindInterfaceDontCare)
-        request.bInterfaceSubClass = UInt16(kIOUSBFindInterfaceDontCare)
-        request.bInterfaceProtocol = UInt16(kIOUSBFindInterfaceDontCare)
-        request.bAlternateSetting = UInt16(kIOUSBFindInterfaceDontCare)
-
-        let ciret = devIface.CreateInterfaceIterator(dev, &request, &interfaceIterator)
-        guard ciret == kIOReturnSuccess else { return nil }
-
-        let obj = IOIteratorNext(interfaceIterator)
-        defer { IOObjectRelease(obj) }
-        guard obj != 0 else { return nil }
-
-        let ret = IOCreatePlugInInterfaceForService(obj, kIOUSBInterfaceUserClientTypeID, kIOCFPlugInInterfaceID, &plugin, &score)
-        guard ret == kIOReturnSuccess, let pluginIface = plugin?.pointee?.pointee else { return nil }
-        defer { IODestroyPlugInInterface(plugin) }
-
-        let qret = withUnsafeMutablePointer(to: &iface) {
-            $0.withMemoryRebound(to: LPVOID?.self, capacity: 1) {
-                pluginIface.QueryInterface(plugin, CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID), $0)
-            }
-        }
-        guard qret == kIOReturnSuccess, let ifaceIface = iface?.pointee?.pointee else { return nil }
-
-        let openRet = ifaceIface.USBInterfaceOpen(iface)
-        guard openRet == kIOReturnSuccess else {
-            if openRet == kIOReturnExclusiveAccess {
-                printErr("Cannot access VMM7100 - device is in use by another process")
-            } else {
-                printErr("Cannot open VMM7100 USB interface (error: \(openRet))")
-            }
-            return nil
-        }
-        return (iface, ifaceIface)
+        return Data(buffer.prefix(length))
     }
 }
 
@@ -619,7 +535,7 @@ class VMM7100Tool {
         if mock {
             self.transport = VMM7100MockTransport()
         } else {
-            self.transport = VMM7100USBTransport()
+            self.transport = VMM7100HIDTransport()
         }
     }
 
@@ -686,19 +602,24 @@ class VMM7100Tool {
         print("VMM7100 Adapter Info")
         print("====================")
 
-        // Chip ID
+        // Chip ID — little-endian from device
         let (idOk, idData) = rcCommand(cmd: .getId)
         if idOk && idData.count >= 2 {
-            let chipId = (UInt16(idData[0]) << 8) | UInt16(idData[1])
-            let rev = idData.count >= 3 ? String(format: "%c%d", 0x40 + (idData[2] >> 4), idData[2] & 0x0F) : "?"
-            print("  Chip ID:          VMM\(String(format: "%04X", chipId))")
-            print("  Chip revision:    \(rev)")
+            let chipId = UInt16(idData[0]) | (UInt16(idData[1]) << 8)
+            print("  Chip ID:          VMM\(String(format: "%X", chipId))")
+            if idData.count >= 3 {
+                let rev = idData[2]
+                print("  Chip revision:    \(String(format: "%c%d", 0x40 + (rev >> 4), rev & 0x0F))")
+            }
         }
 
-        // FW Version
+        // FW Version — real device returns [minor, major, ...] at bytes 15+
         let (verOk, verData) = rcCommand(cmd: .getVersion)
-        if verOk && verData.count >= 3 {
-            print("  Firmware version: \(verData[0]).\(String(format: "%02d", verData[1])).\(String(format: "%03d", verData[2]))")
+        if verOk && verData.count >= 2 {
+            let major = verData[1]  // byte[16] in packet
+            let minor = verData[0]  // byte[15] in packet
+            let patch: UInt8 = verData.count >= 3 ? verData[2] : 0
+            print("  Firmware version: \(major).\(String(format: "%02d", minor)).\(String(format: "%03d", patch))")
         }
 
         // Read firmware name from memory
@@ -921,8 +842,10 @@ class VMM7100Tool {
         // Read current version + chip info for backup naming
         var versionStr = "unknown"
         let (verOk, verData) = rcCommand(cmd: .getVersion)
-        if verOk && verData.count >= 3 {
-            versionStr = "\(verData[0]).\(String(format: "%02d", verData[1])).\(String(format: "%03d", verData[2]))"
+        if verOk && verData.count >= 2 {
+            let major = verData[1]; let minor = verData[0]
+            let patch: UInt8 = verData.count >= 3 ? verData[2] : 0
+            versionStr = "\(major).\(String(format: "%02d", minor)).\(String(format: "%03d", patch))"
             print("Current FW: \(versionStr)")
         }
 
