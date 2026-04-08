@@ -170,6 +170,127 @@ From examining `Spyder_fw_USBC_CMforMac4K120hz.fullrom` (1,048,576 bytes):
 0x20000 - 0xFFFFF:  Firmware code (EEPROM_BANK_OFFSET from fwupd)
 ```
 
+## Flash Write Findings
+
+### Write commands "succeed" but don't persist
+- `WriteToEEPROM` (cmd 0x20) returns byte[6]=0 (success) at offsets 0x0 and 0x20000
+- Returns byte[6]=1 (invalid) at offset 0xF0000
+- But GetVersion unchanged after writing full firmware → data not actually written to flash
+- SPI NOR flash requires erase before write — without erase, writes are no-ops
+
+### FlashErase always fails via HID
+All parameter variations tried:
+
+| Attempt | Params | Result |
+|---------|--------|--------|
+| Sector erase | offset=0xF0000, len=0x3000 | byte[6]=3 (failed) |
+| Sector erase | offset=0x0, len=0x3000 | byte[6]=3 |
+| 4K erase | offset=0x0, len=0x1000 | byte[6]=3 |
+| Raw 64K | offset=0x0, len=0x10000 | byte[6]=3 |
+| fwupd format | offset=0, data=[0xFF,0xFF], len=2 | byte[6]=3 |
+| Alt: offset as type | offset=0xFFFF, len=0 | byte[6]=3 |
+| After EnableFlashChipErase (0x08) | all above | still byte[6]=3 |
+
+### Correct flash parameters (from fwupd source)
+fwupd's `set_flash_sector_erase` for Spyder/Cayenne full chip erase:
+```c
+// buf = uint16_le(0xFFFF + 0) = [0xFF, 0xFF]
+rc_set_command(FLASH_ERASE, offset=0, data=buf, len=2)
+```
+Then sleep 5000ms, then write 64-byte chunks, verify CRC16, activate.
+
+### Firmware size is 320KB, not 1MB
+- `.fullrom` files are 1MB but actual firmware = `CAYENNE_FIRMWARE_SIZE = 0x50000` (320KB)
+- Layout: EDID at 0x0, zeros 0x80-0x1FFFF, firmware code at 0x20000-0x6FFFF
+
+### ActivateFirmware returns unknown code
+- `ActivateFirmware` (cmd 0x18) returns byte[6]=5, which is outside documented range (0-4)
+- Possibly means "no new firmware detected" or "flash unchanged"
+
+### Restart sequence (from vmm7100reset + fwupd)
+fwupd's restart after flash:
+```
+WriteToMemory(offset=0x2020021C, data=[0xF5, 0x00, 0x00, 0x00])
+```
+This matches vmm7100reset.swift's third packet exactly.
+
+## Conclusion: Why HID Flash Doesn't Work
+
+**FlashErase is not supported via HID.** The VMM7100's HID firmware accepts the command but returns error 3 (failed) for all parameter variations. Without erase, SPI NOR writes are no-ops.
+
+The HID interface supports:
+- ✅ EnableRC / DisableRC
+- ✅ GetId, GetVersion (read chip info from registers)
+- ✅ WriteToMemory (for reset/restart sequence)
+- ❌ FlashErase (always fails)
+- ❌ ReadFromEEPROM / ReadFromMemory (returns empty/stale)
+- ⚠️ WriteToEEPROM (acknowledged but no effect without prior erase)
+- ⚠️ ActivateFirmware (returns code 5)
+- ⚠️ CalCRC16 (returns zeros)
+
+VmmHIDTool on Windows likely works because Windows can simultaneously access the DP AUX channel through the GPU driver (AMD/Intel display driver) alongside HID. The "HID" in VmmHIDTool may be misleading — it probably uses HID for control/status but DP AUX for actual flash operations.
+
+### Only viable paths for macOS firmware flash
+1. **USB packet capture** from VmmHIDTool on Windows (Wireshark + USBPcap) to discover if there's a secret initialization sequence
+2. **Windows VM** with USB passthrough (UTM/Parallels) — the documented working approach
+3. **DP AUX on macOS** — requires access to DisplayPort AUX channel, see section below
+
+## DP AUX on macOS
+
+### What is DP AUX?
+DisplayPort Auxiliary (AUX) channel is a low-bandwidth sideband channel in DisplayPort connections. It's used for:
+- DPCD (DisplayPort Configuration Data) register access
+- EDID reading
+- Link training
+- MST (Multi-Stream Transport) sideband messaging
+- **Firmware updates** (Flash-over-AUX)
+
+### How Linux exposes DP AUX
+Linux kernel (4.6+) exposes `/dev/drm_dp_aux*` devices. fwupd reads/writes DPCD registers directly:
+```c
+fu_dpaux_device_read(device, 0x4B2, buf, 1, timeout, error)  // read RC_CMD register
+fu_dpaux_device_write(device, 0x4C0, data, 32, timeout, error)  // write RC_DATA
+```
+
+### macOS DP AUX status
+- **No public API.** macOS does not expose DP AUX channel to userspace.
+- GPU drivers (Apple Silicon GPU, AMD) handle DP AUX internally for link training and EDID.
+- `IOFramebuffer` / `IODisplay` kexts manage display connections but don't expose raw AUX access.
+- No equivalent to Linux's `/dev/drm_dp_aux*`.
+
+### Potential macOS DP AUX approaches (all speculative)
+
+1. **IOKit IOFramebuffer private API**
+   - `IOFramebuffer` has internal DP AUX methods used by macOS for EDID/DPCD
+   - These are private, undocumented, and change between macOS versions
+   - Would require reverse engineering the IOFramebuffer kernel extension
+
+2. **DriverKit / DEXT**
+   - A custom DriverKit extension could potentially access the USB device's DP AUX
+   - But DP AUX goes through the GPU, not USB — the USB-C port routes DP signals to the GPU
+   - DriverKit doesn't have APIs for GPU/display subsystem access
+
+3. **IODisplayConnect / IODisplay**
+   - `IODisplayConnect` objects in IORegistry contain EDID data read via AUX
+   - But there's no public method to send arbitrary DPCD register writes
+
+4. **Metal / CoreDisplay private frameworks**
+   - `CoreDisplay.framework` has private SPI for display management
+   - `CGSDisplayAuxIO` or similar private functions may exist but are undocumented
+
+5. **I2C-over-USB fallback**
+   - The VMM7100 has an I2C debug port (from datasheet strings)
+   - If accessible via USB, could bypass the DP AUX requirement
+   - But no evidence the HID interface exposes I2C
+
+### Bottom line
+macOS DP AUX access requires either:
+- Apple adding a public API (unlikely for niche use case)
+- Reverse engineering private IOFramebuffer internals (fragile, breaks on updates)
+- A kernel extension or DriverKit driver for raw DPCD access (significant effort)
+
+For now, **Windows VM with USB passthrough remains the practical solution** for firmware flashing.
+
 ## Key Sources
 
 - [vmm7100reset.swift](https://github.com/waydabber/vmm7100reset) — working macOS HID send pattern, reset packet bytes
