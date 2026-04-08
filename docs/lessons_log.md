@@ -138,10 +138,28 @@ AtUsbHid.dll exports reveal the Windows communication pattern:
   2. macOS HID driver doesn't poll the interrupt endpoint for this vendor-specific device
   3. The VMM7100 firmware only sends interrupt reports in response to DP AUX-triggered events
 
+### 8. Raw USB pipe read after releasing HIDManager
+```swift
+IOHIDManagerClose(mgr, 0)       // release HID driver
+usleep(500000)                   // wait for driver release
+IOUSBInterfaceInterface.USBInterfaceOpen() → kIOReturnExclusiveAccess
+```
+macOS re-claims the HID interface immediately. Cannot access raw interrupt IN pipe.
+
+### 9. IOHIDDeviceRegisterInputReportCallback with instance-stored buffer
+```swift
+class HIDReader {
+    var reportBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 62)  // kept alive
+    // ...register callback with Unmanaged<Self> context...
+    // ...pump CFRunLoop after each send...
+}
+```
+Agent research suggested this pattern (matching hidapi library approach). **Callback still never fires.** macOS HID driver doesn't poll the interrupt IN endpoint for this vendor-specific device class.
+
 ### What would be needed
-- **USB packet capture** from a working Windows session to see exact initialization sequence
-- **Custom kext or DriverKit extension** to do raw interrupt IN pipe reads
-- **Or**: accept that reads aren't available via HID on macOS
+- **DriverKit extension** with direct interrupt IN pipe access (bypasses HID driver)
+- Or **USB packet capture** from Windows to discover any initialization handshake that enables interrupt reporting
+- Or accept that reads aren't available via macOS HID and focus on write path (flash)
 
 ## Firmware File Format (.fullrom)
 
