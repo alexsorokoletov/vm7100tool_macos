@@ -54,6 +54,41 @@ No DP Alt Mode required — communication happens over USB data pins, not Displa
 - CRC16 verification after write
 - `--force` to continue past CRC mismatch (use with caution)
 
+## Tested Setup
+
+### Hardware
+- **Mac**: MacBook Pro M1 Max (macOS 26 Tahoe)
+- **Display**: Samsung Odyssey G95NC (S57CG952), 4K 240Hz
+- **USB-C to HDMI 2.1 adapter**: Cable Matters 201378 (Synaptics VMM7100) — FW 7.02.116 `BC_CM_MBP4k120`
+- **USB-C to DP 2.1 adapter**: Chrontel CH7213D-based — 4K@120Hz
+- **HDMI cable**: Ultra High Speed 48Gbps certified (required for 4K@120Hz)
+
+### Result
+Both adapters running **3840x2160 @ 120Hz** simultaneously on the same display.
+
+### Samsung Odyssey G95NC HDMI port warning
+
+Not all HDMI ports on the G95NC are equal:
+
+| Port | Version | Max 4K | Notes |
+|------|---------|--------|-------|
+| HDMI 1 | HDMI 2.0 | 4K@60Hz | No FRL — will not do 120Hz regardless of adapter/cable |
+| HDMI 2 | HDMI 2.1 | 4K@120Hz+ | Use this for VMM7100 adapter |
+| HDMI 3 | HDMI 2.1 | 4K@120Hz+ | Use this for VMM7100 adapter |
+
+If you're stuck at 4K@60Hz with a known-good adapter and cable, **check which HDMI port you're using**. HDMI 1 is a hardware limitation — no setting or firmware can upgrade it to 2.1 speeds.
+
+## Firmware
+
+The `firmware/` directory contains reference firmware images:
+
+| File | Version | CRC16 | Description |
+|------|---------|-------|-------------|
+| `BC_CM_MBP4k120_7.02.116.fullrom` | 7.02.116 | 0x5668 | Dump from working Cable Matters adapter (4K@120Hz confirmed) |
+| `Spyder_fw_USBC_CMforMac4K120hz.fullrom` | 7.02.102 | 0xF51B | Community 4K120 mod firmware from MacRumors thread |
+
+Use `./vmm7100tool flash --dry-run <file>` to inspect a firmware image before flashing.
+
 ## Sources & References
 
 - [vmm7100reset.swift](https://github.com/waydabber/vmm7100reset) — macOS IOKit USB HID communication pattern for VMM7100

@@ -1,6 +1,7 @@
 vmm7100tool
 *.o
 *.fullrom
+!firmware/*.fullrom
 VmmDPtool64/
 CMI_Firmware_Update_full/
 .DS_Store
